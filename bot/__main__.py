@@ -1,299 +1,500 @@
-from signal import signal, SIGINT
-from os import path as ospath, remove as osremove, execl as osexecl
-from subprocess import run as srun, check_output
-from psutil import disk_usage, cpu_percent, swap_memory, cpu_count, virtual_memory, net_io_counters, boot_time
-from time import time
-from pyrogram import idle
-from sys import executable
-from telegram import InlineKeyboardMarkup
-from telegram.ext import CommandHandler
+from logging import getLogger, FileHandler, StreamHandler, INFO, basicConfig, error as log_error, info as log_info, warning as log_warning
+from socket import setdefaulttimeout
+from faulthandler import enable as faulthandler_enable
+from telegram.ext import Updater as tgUpdater
+from qbittorrentapi import Client as qbClient
+from aria2p import API as ariaAPI, Client as ariaClient
+from os import remove as osremove, path as ospath, environ
+from requests import get as rget
+from json import loads as jsnloads
+from subprocess import Popen, run as srun, check_output
+from time import sleep, time
+from threading import Thread, Lock
+from pyrogram import Client, enums
+from dotenv import load_dotenv
 
-from bot import bot, app, dispatcher, updater, botStartTime, IGNORE_PENDING_REQUESTS, alive, LOGGER, Interval, rss_session, INCOMPLETE_TASK_NOTIFIER, DB_URI
-from .helper.ext_utils.fs_utils import start_cleanup, clean_all, exit_clean_up
-from .helper.ext_utils.telegraph_helper import telegraph
-from .helper.ext_utils.bot_utils import get_readable_file_size, get_readable_time
-from .helper.ext_utils.db_handler import DbManger
-from .helper.telegram_helper.bot_commands import BotCommands
-from .helper.telegram_helper.message_utils import sendMessage, sendMarkup, editMessage, sendLogFile
-from .helper.telegram_helper.filters import CustomFilters
-from .helper.telegram_helper.button_build import ButtonMaker
+faulthandler_enable()
 
-from .modules import authorize, list, cancel_mirror, mirror_status, mirror, clone, watch, shell, eval, delete, count, leech_settings, search, rss
+setdefaulttimeout(600)
 
+botStartTime = time()
 
+basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                    handlers=[FileHandler('log.txt'), StreamHandler()],
+                    level=INFO)
 
-def stats(update, context):
-    if ospath.exists('.git'):
-        last_commit = check_output(["git log -1 --date=short --pretty=format:'%cd <b>From</b> %cr'"], shell=True).decode()
-    else:
-        last_commit = 'No UPSTREAM_REPO'
-    currentTime = get_readable_time(time() - botStartTime)
-    osUptime = get_readable_time(time() - boot_time())
-    total, used, free, disk= disk_usage('/')
-    total = get_readable_file_size(total)
-    used = get_readable_file_size(used)
-    free = get_readable_file_size(free)
-    sent = get_readable_file_size(net_io_counters().bytes_sent)
-    recv = get_readable_file_size(net_io_counters().bytes_recv)
-    cpuUsage = cpu_percent(interval=0.5)
-    p_core = cpu_count(logical=False)
-    t_core = cpu_count(logical=True)
-    swap = swap_memory()
-    swap_p = swap.percent
-    swap_t = get_readable_file_size(swap.total)
-    memory = virtual_memory()
-    mem_p = memory.percent
-    mem_t = get_readable_file_size(memory.total)
-    mem_a = get_readable_file_size(memory.available)
-    mem_u = get_readable_file_size(memory.used)
-    stats = f'<b>Commit Date:</b> {last_commit}\n\n'\
-            f'<b>Bot Uptime:</b> {currentTime}\n'\
-            f'<b>OS Uptime:</b> {osUptime}\n\n'\
-            f'<b>Total Disk Space:</b> {total}\n'\
-            f'<b>Used:</b> {used} | <b>Free:</b> {free}\n\n'\
-            f'<b>Upload:</b> {sent}\n'\
-            f'<b>Download:</b> {recv}\n\n'\
-            f'<b>CPU:</b> {cpuUsage}%\n'\
-            f'<b>RAM:</b> {mem_p}%\n'\
-            f'<b>DISK:</b> {disk}%\n\n'\
-            f'<b>Physical Cores:</b> {p_core}\n'\
-            f'<b>Total Cores:</b> {t_core}\n\n'\
-            f'<b>SWAP:</b> {swap_t} | <b>Used:</b> {swap_p}%\n'\
-            f'<b>Memory Total:</b> {mem_t}\n'\
-            f'<b>Memory Free:</b> {mem_a}\n'\
-            f'<b>Memory Used:</b> {mem_u}\n'
-    sendMessage(stats, context.bot, update.message)
+LOGGER = getLogger(__name__)
 
+load_dotenv('config.env', override=True)
 
-def start(update, context):
-    buttons = ButtonMaker()
-    buttons.buildbutton("Repo", "https://www.github.com/istareatotherscode/anasStableQb")
-    reply_markup = InlineKeyboardMarkup(buttons.build_menu(2))
-    if CustomFilters.authorized_user(update) or CustomFilters.authorized_chat(update):
-        start_string = f'''
-This bot can mirror all your links to Google Drive using aria2c and qbit and other modules!
-Type /{BotCommands.HelpCommand} to get a list of available commands
-'''
-        sendMarkup(start_string, context.bot, update.message, reply_markup)
-    else:
-        sendMarkup('Not Authorized user, deploy your own bot', context.bot, update.message, reply_markup)
+def getConfig(name: str):
+    return environ[name]
 
-def restart(update, context):
-    restart_message = sendMessage("Restarting...", context.bot, update.message)
-    if Interval:
-        Interval[0].cancel()
-    alive.kill()
-    clean_all()
-    srun(["pkill", "-f", "gunicorn|aria2c|qbittorrent-nox"])
-    srun(["python3", "update.py"])
-    with open(".restartmsg", "w") as f:
-        f.truncate(0)
-        f.write(f"{restart_message.chat.id}\n{restart_message.message_id}\n")
-    osexecl(executable, executable, "-m", "bot")
+try:
+    NETRC_URL = getConfig('NETRC_URL')
+    if len(NETRC_URL) == 0:
+        raise KeyError
+    try:
+        res = rget(NETRC_URL)
+        if res.status_code == 200:
+            with open('.netrc', 'wb+') as f:
+                f.write(res.content)
+        else:
+            log_error(f"Failed to download .netrc {res.status_code}")
+    except Exception as e:
+        log_error(f"NETRC_URL: {e}")
+except:
+    pass
+try:
+    SERVER_PORT = getConfig('SERVER_PORT')
+    if len(SERVER_PORT) == 0:
+        raise KeyError
+except:
+    SERVER_PORT = 80
 
+PORT = environ.get('PORT', SERVER_PORT)
+alive = Popen(["python3", "alive.py"])
+Popen([f"gunicorn web.wserver:app --bind 0.0.0.0:{PORT}"], shell=True)
+srun(["qbittorrent-nox", "-d", "--profile=."])
+if not ospath.exists('.netrc'):
+    srun(["touch", ".netrc"])
+srun(["cp", ".netrc", "/root/.netrc"])
+srun(["chmod", "600", ".netrc"])
+srun(["chmod", "+x", "aria.sh"])
+srun(["./aria.sh"], shell=True)
 
-def ping(update, context):
-    start_time = int(round(time() * 1000))
-    reply = sendMessage("Starting Ping", context.bot, update.message)
-    end_time = int(round(time() * 1000))
-    editMessage(f'{end_time - start_time} ms', reply)
+Interval = []
+DRIVES_NAMES = []
+DRIVES_IDS = []
+INDEX_URLS = []
 
+try:
+    if bool(getConfig('_____REMOVE_THIS_LINE_____')):
+        log_error('The README.md file there to be read! Exiting now!')
+        exit()
+except:
+    pass
 
-def log(update, context):
-    sendLogFile(context.bot, update.message)
+aria2 = ariaAPI(
+    ariaClient(
+        host="http://localhost",
+        port=6800,
+        secret="",
+    )
+)
 
+def get_client():
+    return qbClient(host="localhost", port=8090)
 
-help_string_telegraph = f'''<br>
-<b>/{BotCommands.HelpCommand}</b>: To get this message
-<br><br>
-<b>/{BotCommands.MirrorCommand}</b> [download_url][magnet_link]: Start mirroring to Google Drive. Send <b>/{BotCommands.MirrorCommand}</b> for more help
-<br><br>
-<b>/{BotCommands.ZipMirrorCommand}</b> [download_url][magnet_link]: Start mirroring and upload the file/folder compressed with zip extension
-<br><br>
-<b>/{BotCommands.UnzipMirrorCommand}</b> [download_url][magnet_link]: Start mirroring and upload the file/folder extracted from any archive extension
-<br><br>
-<b>/{BotCommands.QbMirrorCommand}</b> [magnet_link][torrent_file][torrent_file_url]: Start Mirroring using qBittorrent, Use <b>/{BotCommands.QbMirrorCommand} s</b> to select files before downloading
-<br><br>
-<b>/{BotCommands.QbZipMirrorCommand}</b> [magnet_link][torrent_file][torrent_file_url]: Start mirroring using qBittorrent and upload the file/folder compressed with zip extension
-<br><br>
-<b>/{BotCommands.QbUnzipMirrorCommand}</b> [magnet_link][torrent_file][torrent_file_url]: Start mirroring using qBittorrent and upload the file/folder extracted from any archive extension
-<br><br>
-<b>/{BotCommands.LeechCommand}</b> [download_url][magnet_link]: Start leeching to Telegram, Use <b>/{BotCommands.LeechCommand} s</b> to select files before leeching
-<br><br>
-<b>/{BotCommands.ZipLeechCommand}</b> [download_url][magnet_link]: Start leeching to Telegram and upload the file/folder compressed with zip extension
-<br><br>
-<b>/{BotCommands.UnzipLeechCommand}</b> [download_url][magnet_link][torent_file]: Start leeching to Telegram and upload the file/folder extracted from any archive extension
-<br><br>
-<b>/{BotCommands.QbLeechCommand}</b> [magnet_link][torrent_file][torrent_file_url]: Start leeching to Telegram using qBittorrent, Use <b>/{BotCommands.QbLeechCommand} s</b> to select files before leeching
-<br><br>
-<b>/{BotCommands.QbZipLeechCommand}</b> [magnet_link][torrent_file][torrent_file_url]: Start leeching to Telegram using qBittorrent and upload the file/folder compressed with zip extension
-<br><br>
-<b>/{BotCommands.QbUnzipLeechCommand}</b> [magnet_link][torrent_file][torrent_file_url]: Start leeching to Telegram using qBittorrent and upload the file/folder extracted from any archive extension
-<br><br>
-<b>/{BotCommands.CloneCommand}</b> [drive_url][gdtot_url]: Copy file/folder to Google Drive
-<br><br>
-<b>/{BotCommands.CountCommand}</b> [drive_url][gdtot_url]: Count file/folder of Google Drive
-<br><br>
-<b>/{BotCommands.DeleteCommand}</b> [drive_url]: Delete file/folder from Google Drive (Only Owner & Sudo)
-<br><br>
-<b>/{BotCommands.WatchCommand}</b> [yt-dlp supported link]: Mirror yt-dlp supported link. Send <b>/{BotCommands.WatchCommand}</b> for more help
-<br><br>
-<b>/{BotCommands.ZipWatchCommand}</b> [yt-dlp supported link]: Mirror yt-dlp supported link as zip
-<br><br>
-<b>/{BotCommands.LeechWatchCommand}</b> [yt-dlp supported link]: Leech yt-dlp supported link
-<br><br>
-<b>/{BotCommands.LeechZipWatchCommand}</b> [yt-dlp supported link]: Leech yt-dlp supported link as zip
-<br><br>
-<b>/{BotCommands.LeechSetCommand}</b>: Leech settings
-<br><br>
-<b>/{BotCommands.SetThumbCommand}</b>: Reply photo to set it as Thumbnail
-<br><br>
-<b>/{BotCommands.RssListCommand}</b>: List all subscribed rss feed info
-<br><br>
-<b>/{BotCommands.RssGetCommand}</b>: [Title] [Number](last N links): Force fetch last N links
-<br><br>
-<b>/{BotCommands.RssSubCommand}</b>: [Title] [Rss Link] f: [filter]: Subscribe new rss feed
-<br><br>
-<b>/{BotCommands.RssUnSubCommand}</b>: [Title]: Unubscribe rss feed by title
-<br><br>
-<b>/{BotCommands.RssSettingsCommand}</b>: Rss Settings
-<br><br>
-<b>/{BotCommands.CancelMirror}</b>: Reply to the message by which the download was initiated and that download will be cancelled
-<br><br>
-<b>/{BotCommands.CancelAllCommand}</b>: Cancel all downloading tasks
-<br><br>
-<b>/{BotCommands.ListCommand}</b> [query]: Search in Google Drive(s)
-<br><br>
-<b>/{BotCommands.StatusCommand}</b>: Shows a status of all the downloads
-<br><br>
-<b>/{BotCommands.StatsCommand}</b>: Show Stats of the machine the bot is hosted on
-'''
+trackers = check_output(["curl -Ns https://raw.githubusercontent.com/XIU2/TrackersListCollection/master/all.txt https://ngosang.github.io/trackerslist/trackers_all_http.txt https://newtrackon.com/api/all | awk '$0'"], shell=True).decode('utf-8')
+trackerslist = set(trackers.split("\n"))
+trackerslist.remove("")
+trackerslist = "\n\n".join(trackerslist)
+trackerlists =  " "
+get_client().application.set_preferences({"add_trackers": f"{trackerlists}"})
 
-help = telegraph.create_page(
-        title='Sree Mirror Bot Help',
-        content=help_string_telegraph,
-    )["path"]
+DOWNLOAD_DIR = None
+BOT_TOKEN = None
 
-help_string = f'''
-/{BotCommands.PingCommand}: Check how long it takes to Ping the Bot
+download_dict_lock = Lock()
+status_reply_dict_lock = Lock()
+# Key: update.effective_chat.id
+# Value: telegram.Message
+status_reply_dict = {}
+# Key: update.message.message_id
+# Value: An object of Status
+download_dict = {}
+# key: rss_title
+# value: [rss_feed, last_link, last_title, filter]
+rss_dict = {}
 
-/{BotCommands.AuthorizeCommand}: Authorize a chat or a user to use the bot (Can only be invoked by Owner & Sudo of the bot)
+AUTHORIZED_CHATS = set()
+SUDO_USERS = set()
+AS_DOC_USERS = set()
+AS_MEDIA_USERS = set()
+EXTENTION_FILTER = set(['.torrent'])
 
-/{BotCommands.UnAuthorizeCommand}: Unauthorize a chat or a user to use the bot (Can only be invoked by Owner & Sudo of the bot)
+try:
+    aid = getConfig('AUTHORIZED_CHATS')
+    aid = aid.split(' ')
+    for _id in aid:
+        AUTHORIZED_CHATS.add(int(_id))
+except:
+    pass
+try:
+    aid = getConfig('SUDO_USERS')
+    aid = aid.split(' ')
+    for _id in aid:
+        SUDO_USERS.add(int(_id))
+except:
+    pass
+try:
+    fx = getConfig('EXTENTION_FILTER')
+    if len(fx) > 0:
+        fx = fx.split(' ')
+        for x in fx:
+            EXTENTION_FILTER.add(x.lower())
+except:
+    pass
+try:
+    BOT_TOKEN = getConfig('BOT_TOKEN')
+    parent_id = getConfig('GDRIVE_FOLDER_ID')
+    DOWNLOAD_DIR = getConfig('DOWNLOAD_DIR')
+    if not DOWNLOAD_DIR.endswith("/"):
+        DOWNLOAD_DIR = DOWNLOAD_DIR + '/'
+    DOWNLOAD_STATUS_UPDATE_INTERVAL = int(getConfig('DOWNLOAD_STATUS_UPDATE_INTERVAL'))
+    OWNER_ID = int(getConfig('OWNER_ID'))
+    AUTO_DELETE_MESSAGE_DURATION = int(getConfig('AUTO_DELETE_MESSAGE_DURATION'))
+    TELEGRAM_API = getConfig('TELEGRAM_API')
+    TELEGRAM_HASH = getConfig('TELEGRAM_HASH')
+except:
+    LOGGER.error("One or more env variables missing! Exiting now")
+    exit(1)
 
-/{BotCommands.AuthorizedUsersCommand}: Show authorized users (Only Owner & Sudo)
+LOGGER.info("Generating BOT_STRING_SESSION")
+app = Client(name='pyrogram', api_id=int(TELEGRAM_API), api_hash=TELEGRAM_HASH, bot_token=BOT_TOKEN, parse_mode=enums.ParseMode.HTML, no_updates=True)
 
-/{BotCommands.AddSudoCommand}: Add sudo user (Only Owner)
+try:
+    USER_STRING_SESSION = getConfig('USER_STRING_SESSION')
+    if len(USER_STRING_SESSION) == 0:
+        raise KeyError
+    rss_session = Client(name='rss_session', api_id=int(TELEGRAM_API), api_hash=TELEGRAM_HASH, session_string=USER_STRING_SESSION, parse_mode=enums.ParseMode.HTML)
+except:
+    USER_STRING_SESSION = None
+    rss_session = None
 
-/{BotCommands.RmSudoCommand}: Remove sudo users (Only Owner)
+def aria2c_init():
+    try:
+        log_info("Initializing Aria2c")
+        link = "https://speed.hetzner.de/100MB.bin"
+        dire = DOWNLOAD_DIR.rstrip("/")
+        aria2.add_uris([link], {'dir': dire})
+        sleep(3)
+        downloads = aria2.get_downloads()
+        sleep(20)
+        for download in downloads:
+            aria2.remove([download], force=True, files=True)
+    except Exception as e:
+        log_error(f"Aria2c initializing error: {e}")
+Thread(target=aria2c_init).start()
+sleep(1.5)
 
-/{BotCommands.RestartCommand}: Restart and update the bot
+try:
+    MEGA_API_KEY = getConfig('MEGA_API_KEY')
+    if len(MEGA_API_KEY) == 0:
+        raise KeyError
+except:
+    log_warning('MEGA API KEY not provided!')
+    MEGA_API_KEY = None
+try:
+    MEGA_EMAIL_ID = getConfig('MEGA_EMAIL_ID')
+    MEGA_PASSWORD = getConfig('MEGA_PASSWORD')
+    if len(MEGA_EMAIL_ID) == 0 or len(MEGA_PASSWORD) == 0:
+        raise KeyError
+except:
+    log_warning('MEGA Credentials not provided!')
+    MEGA_EMAIL_ID = None
+    MEGA_PASSWORD = None
+try:
+    DB_URI = getConfig('DATABASE_URL')
+    if len(DB_URI) == 0:
+        raise KeyError
+except:
+    DB_URI = None
+try:
+    TG_SPLIT_SIZE = getConfig('TG_SPLIT_SIZE')
+    if len(TG_SPLIT_SIZE) == 0 or int(TG_SPLIT_SIZE) > 2097151000:
+        raise KeyError
+    TG_SPLIT_SIZE = int(TG_SPLIT_SIZE)
+except:
+    TG_SPLIT_SIZE = 2097151000
+try:
+    STATUS_LIMIT = getConfig('STATUS_LIMIT')
+    if len(STATUS_LIMIT) == 0:
+        raise KeyError
+    STATUS_LIMIT = int(STATUS_LIMIT)
+except:
+    STATUS_LIMIT = None
+try:
+    UPTOBOX_TOKEN = getConfig('UPTOBOX_TOKEN')
+    if len(UPTOBOX_TOKEN) == 0:
+        raise KeyError
+except:
+    UPTOBOX_TOKEN = None
+try:
+    INDEX_URL = getConfig('INDEX_URL').rstrip("/")
+    if len(INDEX_URL) == 0:
+        raise KeyError
+    INDEX_URLS.append(INDEX_URL)
+except:
+    INDEX_URL = None
+    INDEX_URLS.append(None)
+try:
+    SEARCH_API_LINK = getConfig('SEARCH_API_LINK').rstrip("/")
+    if len(SEARCH_API_LINK) == 0:
+        raise KeyError
+except:
+    SEARCH_API_LINK = None
+try:
+    SEARCH_LIMIT = getConfig('SEARCH_LIMIT')
+    if len(SEARCH_LIMIT) == 0:
+        raise KeyError
+    SEARCH_LIMIT = int(SEARCH_LIMIT)
+except:
+    SEARCH_LIMIT = 0
+try:
+    RSS_COMMAND = getConfig('RSS_COMMAND')
+    if len(RSS_COMMAND) == 0:
+        raise KeyError
+except:
+    RSS_COMMAND = None
+try:
+    CMD_INDEX = getConfig('CMD_INDEX')
+    if len(CMD_INDEX) == 0:
+        raise KeyError
+except:
+    CMD_INDEX = ''
+try:
+    TORRENT_DIRECT_LIMIT = getConfig('TORRENT_DIRECT_LIMIT')
+    if len(TORRENT_DIRECT_LIMIT) == 0:
+        raise KeyError
+    TORRENT_DIRECT_LIMIT = float(TORRENT_DIRECT_LIMIT)
+except:
+    TORRENT_DIRECT_LIMIT = None
+try:
+    CLONE_LIMIT = getConfig('CLONE_LIMIT')
+    if len(CLONE_LIMIT) == 0:
+        raise KeyError
+    CLONE_LIMIT = float(CLONE_LIMIT)
+except:
+    CLONE_LIMIT = None
+try:
+    MEGA_LIMIT = getConfig('MEGA_LIMIT')
+    if len(MEGA_LIMIT) == 0:
+        raise KeyError
+    MEGA_LIMIT = float(MEGA_LIMIT)
+except:
+    MEGA_LIMIT = None
+try:
+    STORAGE_THRESHOLD = getConfig('STORAGE_THRESHOLD')
+    if len(STORAGE_THRESHOLD) == 0:
+        raise KeyError
+    STORAGE_THRESHOLD = float(STORAGE_THRESHOLD)
+except:
+    STORAGE_THRESHOLD = None
+try:
+    ZIP_UNZIP_LIMIT = getConfig('ZIP_UNZIP_LIMIT')
+    if len(ZIP_UNZIP_LIMIT) == 0:
+        raise KeyError
+    ZIP_UNZIP_LIMIT = float(ZIP_UNZIP_LIMIT)
+except:
+    ZIP_UNZIP_LIMIT = None
+try:
+    RSS_CHAT_ID = getConfig('RSS_CHAT_ID')
+    if len(RSS_CHAT_ID) == 0:
+        raise KeyError
+    RSS_CHAT_ID = int(RSS_CHAT_ID)
+except:
+    RSS_CHAT_ID = None
+try:
+    RSS_DELAY = getConfig('RSS_DELAY')
+    if len(RSS_DELAY) == 0:
+        raise KeyError
+    RSS_DELAY = int(RSS_DELAY)
+except:
+    RSS_DELAY = 900
+try:
+    TORRENT_TIMEOUT = getConfig('TORRENT_TIMEOUT')
+    if len(TORRENT_TIMEOUT) == 0:
+        raise KeyError
+    TORRENT_TIMEOUT = int(TORRENT_TIMEOUT)
+except:
+    TORRENT_TIMEOUT = None
+try:
+    BUTTON_FOUR_NAME = getConfig('BUTTON_FOUR_NAME')
+    BUTTON_FOUR_URL = getConfig('BUTTON_FOUR_URL')
+    if len(BUTTON_FOUR_NAME) == 0 or len(BUTTON_FOUR_URL) == 0:
+        raise KeyError
+except:
+    BUTTON_FOUR_NAME = None
+    BUTTON_FOUR_URL = None
+try:
+    BUTTON_FIVE_NAME = getConfig('BUTTON_FIVE_NAME')
+    BUTTON_FIVE_URL = getConfig('BUTTON_FIVE_URL')
+    if len(BUTTON_FIVE_NAME) == 0 or len(BUTTON_FIVE_URL) == 0:
+        raise KeyError
+except:
+    BUTTON_FIVE_NAME = None
+    BUTTON_FIVE_URL = None
+try:
+    BUTTON_SIX_NAME = getConfig('BUTTON_SIX_NAME')
+    BUTTON_SIX_URL = getConfig('BUTTON_SIX_URL')
+    if len(BUTTON_SIX_NAME) == 0 or len(BUTTON_SIX_URL) == 0:
+        raise KeyError
+except:
+    BUTTON_SIX_NAME = None
+    BUTTON_SIX_URL = None
+try:
+    INCOMPLETE_TASK_NOTIFIER = getConfig('INCOMPLETE_TASK_NOTIFIER')
+    INCOMPLETE_TASK_NOTIFIER = INCOMPLETE_TASK_NOTIFIER.lower() == 'true'
+except:
+    INCOMPLETE_TASK_NOTIFIER = False
+try:
+    STOP_DUPLICATE = getConfig('STOP_DUPLICATE')
+    STOP_DUPLICATE = STOP_DUPLICATE.lower() == 'true'
+except:
+    STOP_DUPLICATE = False
+try:
+    VIEW_LINK = getConfig('VIEW_LINK')
+    VIEW_LINK = VIEW_LINK.lower() == 'true'
+except:
+    VIEW_LINK = False
+try:
+    IS_TEAM_DRIVE = getConfig('IS_TEAM_DRIVE')
+    IS_TEAM_DRIVE = IS_TEAM_DRIVE.lower() == 'true'
+except:
+    IS_TEAM_DRIVE = False
+try:
+    USE_SERVICE_ACCOUNTS = getConfig('USE_SERVICE_ACCOUNTS')
+    USE_SERVICE_ACCOUNTS = USE_SERVICE_ACCOUNTS.lower() == 'true'
+except:
+    USE_SERVICE_ACCOUNTS = False
+try:
+    WEB_PINCODE = getConfig('WEB_PINCODE')
+    WEB_PINCODE = WEB_PINCODE.lower() == 'true'
+except:
+    WEB_PINCODE = False
+try:
+    SHORTENER = getConfig('SHORTENER')
+    SHORTENER_API = getConfig('SHORTENER_API')
+    if len(SHORTENER) == 0 or len(SHORTENER_API) == 0:
+        raise KeyError
+except:
+    SHORTENER = None
+    SHORTENER_API = None
+try:
+    IGNORE_PENDING_REQUESTS = getConfig("IGNORE_PENDING_REQUESTS")
+    IGNORE_PENDING_REQUESTS = IGNORE_PENDING_REQUESTS.lower() == 'true'
+except:
+    IGNORE_PENDING_REQUESTS = False
+try:
+    BASE_URL = getConfig('BASE_URL_OF_BOT').rstrip("/")
+    if len(BASE_URL) == 0:
+        raise KeyError
+except:
+    log_warning('BASE_URL_OF_BOT not provided!')
+    BASE_URL = None
+try:
+    AS_DOCUMENT = getConfig('AS_DOCUMENT')
+    AS_DOCUMENT = AS_DOCUMENT.lower() == 'true'
+except:
+    AS_DOCUMENT = False
+try:
+    EQUAL_SPLITS = getConfig('EQUAL_SPLITS')
+    EQUAL_SPLITS = EQUAL_SPLITS.lower() == 'true'
+except:
+    EQUAL_SPLITS = False
+try:
+    QB_SEED = getConfig('QB_SEED')
+    QB_SEED = QB_SEED.lower() == 'true'
+except:
+    QB_SEED = False
+try:
+    CUSTOM_FILENAME = getConfig('CUSTOM_FILENAME')
+    if len(CUSTOM_FILENAME) == 0:
+        raise KeyError
+except:
+    CUSTOM_FILENAME = None
+try:
+    CRYPT = getConfig('CRYPT')
+    if len(CRYPT) == 0:
+        raise KeyError
+except:
+    CRYPT = None
+try:
+    TOKEN_PICKLE_URL = getConfig('TOKEN_PICKLE_URL')
+    if len(TOKEN_PICKLE_URL) == 0:
+        raise KeyError
+    try:
+        res = rget(TOKEN_PICKLE_URL)
+        if res.status_code == 200:
+            with open('token.pickle', 'wb+') as f:
+                f.write(res.content)
+        else:
+            log_error(f"Failed to download token.pickle, link got HTTP response: {res.status_code}")
+    except Exception as e:
+        log_error(f"TOKEN_PICKLE_URL: {e}")
+except:
+    pass
+try:
+    ACCOUNTS_ZIP_URL = getConfig('ACCOUNTS_ZIP_URL')
+    if len(ACCOUNTS_ZIP_URL) == 0:
+        raise KeyError
+    try:
+        res = rget(ACCOUNTS_ZIP_URL)
+        if res.status_code == 200:
+            with open('accounts.zip', 'wb+') as f:
+                f.write(res.content)
+        else:
+            log_error(f"Failed to download accounts.zip, link got HTTP response: {res.status_code}")
+    except Exception as e:
+        log_error(f"ACCOUNTS_ZIP_URL: {e}")
+        raise KeyError
+    srun(["unzip", "-q", "-o", "accounts.zip"])
+    srun(["chmod", "-R", "777", "accounts"])
+    osremove("accounts.zip")
+except:
+    pass
+try:
+    MULTI_SEARCH_URL = getConfig('MULTI_SEARCH_URL')
+    if len(MULTI_SEARCH_URL) == 0:
+        raise KeyError
+    try:
+        res = rget(MULTI_SEARCH_URL)
+        if res.status_code == 200:
+            with open('drive_folder', 'wb+') as f:
+                f.write(res.content)
+        else:
+            log_error(f"Failed to download drive_folder, link got HTTP response: {res.status_code}")
+    except Exception as e:
+        log_error(f"MULTI_SEARCH_URL: {e}")
+except:
+    pass
+try:
+    YT_COOKIES_URL = getConfig('YT_COOKIES_URL')
+    if len(YT_COOKIES_URL) == 0:
+        raise KeyError
+    try:
+        res = rget(YT_COOKIES_URL)
+        if res.status_code == 200:
+            with open('cookies.txt', 'wb+') as f:
+                f.write(res.content)
+        else:
+            log_error(f"Failed to download cookies.txt, link got HTTP response: {res.status_code}")
+    except Exception as e:
+        log_error(f"YT_COOKIES_URL: {e}")
+except:
+    pass
 
-/{BotCommands.LogCommand}: Get a log file of the bot. Handy for getting crash reports
+DRIVES_NAMES.append("Main")
+DRIVES_IDS.append(parent_id)
+if ospath.exists('drive_folder'):
+    with open('drive_folder', 'r+') as f:
+        lines = f.readlines()
+        for line in lines:
+            try:
+                temp = line.strip().split()
+                DRIVES_IDS.append(temp[1])
+                DRIVES_NAMES.append(temp[0].replace("_", " "))
+            except:
+                pass
+            try:
+                INDEX_URLS.append(temp[2])
+            except:
+                INDEX_URLS.append(None)
 
-/{BotCommands.ShellCommand}: Run commands in Shell (Only Owner)
-
-/{BotCommands.ExecHelpCommand}: Get help for Executor module (Only Owner)
-'''
-
-def bot_help(update, context):
-    button = ButtonMaker()
-    button.buildbutton("Other Commands", f"https://telegra.ph/{help}")
-    reply_markup = InlineKeyboardMarkup(button.build_menu(1))
-    sendMarkup(help_string, context.bot, update.message, reply_markup)
-
-botcmds = [
-
-        (f'{BotCommands.MirrorCommand}', 'Mirror'),
-        (f'{BotCommands.ZipMirrorCommand}','Mirror and upload as zip'),
-        (f'{BotCommands.UnzipMirrorCommand}','Mirror and extract files'),
-        (f'{BotCommands.QbMirrorCommand}','Mirror torrent using qBittorrent'),
-        (f'{BotCommands.QbZipMirrorCommand}','Mirror torrent and upload as zip using qb'),
-        (f'{BotCommands.QbUnzipMirrorCommand}','Mirror torrent and extract files using qb'),
-        (f'{BotCommands.WatchCommand}','Mirror yt-dlp supported link'),
-        (f'{BotCommands.ZipWatchCommand}','Mirror yt-dlp supported link as zip'),
-        (f'{BotCommands.CloneCommand}','Copy file/folder to Drive'),
-        (f'{BotCommands.LeechCommand}','Leech'),
-        (f'{BotCommands.ZipLeechCommand}','Leech and upload as zip'),
-        (f'{BotCommands.UnzipLeechCommand}','Leech and extract files'),
-        (f'{BotCommands.QbLeechCommand}','Leech torrent using qBittorrent'),
-        (f'{BotCommands.QbZipLeechCommand}','Leech torrent and upload as zip using qb'),
-        (f'{BotCommands.QbUnzipLeechCommand}','Leech torrent and extract using qb'),
-        (f'{BotCommands.LeechWatchCommand}','Leech yt-dlp supported link'),
-        (f'{BotCommands.LeechZipWatchCommand}','Leech yt-dlp supported link as zip'),
-        (f'{BotCommands.CountCommand}','Count file/folder of Drive'),
-        (f'{BotCommands.DeleteCommand}','Delete file/folder from Drive'),
-        (f'{BotCommands.CancelMirror}','Cancel a task'),
-        (f'{BotCommands.CancelAllCommand}','Cancel all downloading tasks'),
-        (f'{BotCommands.ListCommand}','Search in Drive'),
-        (f'{BotCommands.LeechSetCommand}','Leech settings'),
-        (f'{BotCommands.SetThumbCommand}','Set thumbnail'),
-        (f'{BotCommands.StatusCommand}','Get mirror status message'),
-        (f'{BotCommands.StatsCommand}','Bot usage stats'),
-        (f'{BotCommands.PingCommand}','Ping the bot'),
-        (f'{BotCommands.RestartCommand}','Restart the bot'),
-        (f'{BotCommands.LogCommand}','Get the bot Log'),
-        (f'{BotCommands.HelpCommand}','Get detailed help')
-    ]
-
-def main():
-    # bot.set_my_commands(botcmds)
-    start_cleanup()
-    if INCOMPLETE_TASK_NOTIFIER and DB_URI is not None:
-        notifier_dict = DbManger().get_incomplete_tasks()
-        if notifier_dict:
-            for cid, data in notifier_dict.items():
-                if ospath.isfile(".restartmsg"):
-                    with open(".restartmsg") as f:
-                        chat_id, msg_id = map(int, f)
-                    msg = 'Your Bot Restarted successfully!'
-                else:
-                    msg = 'Your has been Bot Started!'
-                for tag, links in data.items():
-                     msg += f"\n\n{tag}: "
-                     for index, link in enumerate(links, start=1):
-                         msg += f" <a href='{link}'>{index}</a> |"
-                         if len(msg.encode()) > 4000:
-                             if 'Your Bot Restarted successfully!' in msg and cid == chat_id:
-                                 bot.editMessageText(msg, chat_id, msg_id, parse_mode='HTMl', disable_web_page_preview=True)
-                                 osremove(".restartmsg")
-                             else:
-                                 bot.sendMessage(cid, msg, 'HTML')
-                             msg = ''
-                if 'Your Bot Restarted successfully!' in msg and cid == chat_id:
-                     bot.editMessageText(msg, chat_id, msg_id, parse_mode='HTMl', disable_web_page_preview=True)
-                     osremove(".restartmsg")
-                else:
-                    bot.sendMessage(cid, msg, 'HTML')
-
-    if ospath.isfile(".restartmsg"):
-        with open(".restartmsg") as f:
-            chat_id, msg_id = map(int, f)
-        bot.edit_message_text("Your Bot Restarted successfully!", chat_id, msg_id)
-        osremove(".restartmsg")
-
-    start_handler = CommandHandler(BotCommands.StartCommand, start, run_async=True)
-    ping_handler = CommandHandler(BotCommands.PingCommand, ping,
-                                  filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-    restart_handler = CommandHandler(BotCommands.RestartCommand, restart,
-                                     filters=CustomFilters.owner_filter | CustomFilters.sudo_user, run_async=True)
-    help_handler = CommandHandler(BotCommands.HelpCommand,
-                                  bot_help, filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-    stats_handler = CommandHandler(BotCommands.StatsCommand,
-                                   stats, filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-    log_handler = CommandHandler(BotCommands.LogCommand, log, filters=CustomFilters.owner_filter | CustomFilters.sudo_user, run_async=True)
-    dispatcher.add_handler(start_handler)
-    dispatcher.add_handler(ping_handler)
-    dispatcher.add_handler(restart_handler)
-    dispatcher.add_handler(help_handler)
-    dispatcher.add_handler(stats_handler)
-    dispatcher.add_handler(log_handler)
-    updater.start_polling(drop_pending_updates=IGNORE_PENDING_REQUESTS)
-    LOGGER.info("Your has been Bot Started!")
-    signal(SIGINT, exit_clean_up)
-    if rss_session is not None:
-        rss_session.start()
-
-app.start()
-main()
-idle()
+updater = tgUpdater(token=BOT_TOKEN, request_kwargs={'read_timeout': 20, 'connect_timeout': 15})
+bot = updater.bot
+dispatcher = updater.dispatcher
+job_queue = updater.job_queue
+botname = bot.username
